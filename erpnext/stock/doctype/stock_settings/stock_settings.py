@@ -68,7 +68,7 @@ class StockSettings(Document):
 		use_naming_series: DF.Check
 		use_serial_batch_fields: DF.Check
 		validate_material_transfer_warehouses: DF.Check
-		valuation_method: DF.Literal["FIFO", "Moving Average", "LIFO"]
+		valuation_method: DF.Literal["FIFO", "Moving Average", "LIFO", "Standard Cost"]
 	# end: auto-generated types
 
 	def validate(self):
@@ -84,23 +84,10 @@ class StockSettings(Document):
 		]:
 			frappe.db.set_default(key, self.get(key, ""))
 
-		from erpnext.utilities.naming import set_by_naming_series
+		self.update_item_naming_settings()
+		self.update_barcode_field_visibility()
 
-		set_by_naming_series(
-			"Item",
-			"item_code",
-			self.get("item_naming_by") == "Naming Series",
-			hide_name_field=True,
-			make_mandatory=0,
-		)
-
-		# show/hide barcode field
-		for name in ["barcode", "barcodes", "scan_barcode"]:
-			frappe.make_property_setter(
-				{"fieldname": name, "property": "hidden", "value": 0 if self.show_barcode_field else 1},
-				validate_fields_for_doctype=False,
-			)
-
+		self.validate_over_delivery_receipt_allowance()
 		self.validate_serial_and_batch_no_settings()
 		self.cant_change_valuation_method()
 		self.validate_clean_description_html()
@@ -111,6 +98,34 @@ class StockSettings(Document):
 		self.change_precision_for_purchase()
 		self.change_precision_for_stock_entry()
 		self.validate_do_not_use_batchwise_valuation()
+
+	def update_item_naming_settings(self):
+		if not self.has_value_changed("item_naming_by"):
+			return
+
+		from erpnext.utilities.naming import set_by_naming_series
+
+		set_by_naming_series(
+			"Item",
+			"item_code",
+			self.get("item_naming_by") == "Naming Series",
+			hide_name_field=True,
+			make_mandatory=0,
+		)
+
+	def update_barcode_field_visibility(self):
+		if not self.has_value_changed("show_barcode_field"):
+			return
+
+		for name in ["barcode", "barcodes", "scan_barcode"]:
+			frappe.make_property_setter(
+				{"fieldname": name, "property": "hidden", "value": 0 if self.show_barcode_field else 1},
+				validate_fields_for_doctype=False,
+			)
+
+	def validate_over_delivery_receipt_allowance(self):
+		if not self.over_delivery_receipt_allowance:
+			self.role_allowed_to_over_deliver_receive = None
 
 	def validate_do_not_use_batchwise_valuation(self):
 		doc_before_save = self.get_doc_before_save()
@@ -249,8 +264,10 @@ class StockSettings(Document):
 				_(
 					"You have enabled {0} and {1} in {2}. This can lead to prices from the default price list being inserted in the transaction price list."
 				).format(
-					"<i>{}</i>".format(_(self.meta.get_label("auto_insert_price_list_rate_if_missing"))),
-					"<i>{}</i>".format(_(selling_meta.get_label("fallback_to_default_price_list"))),
+					"<i>{}</i>".format(
+						self.meta.get_translated_label("auto_insert_price_list_rate_if_missing")
+					),
+					"<i>{}</i>".format(selling_meta.get_translated_label("fallback_to_default_price_list")),
 					frappe.bold(_("Selling Settings")),
 				)
 			)

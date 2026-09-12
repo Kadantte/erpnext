@@ -1,6 +1,7 @@
 # Copyright (c) 2018, Frappe Technologies Pvt. Ltd. and Contributors
 # See license.txt
 
+from unittest.mock import patch
 
 import frappe
 from frappe.utils.data import (
@@ -658,23 +659,15 @@ class TestSubscription(ERPNextTestSuite):
 		sub2 = create_subscription(start_date="2018-01-02")
 
 		processed = []
-		original_process = Subscription.process
-		original_rollback = frappe.db.rollback
 
 		def patched(self, posting_date=None):
 			processed.append(self.name)
 			if self.name == sub1.name:
 				raise frappe.ValidationError("forced failure")
 
-		Subscription.process = patched
-		# process_all calls frappe.db.rollback() on error which would otherwise wipe
-		# the test transaction; stub it so we can observe the iteration in isolation.
-		frappe.db.rollback = lambda *a, **kw: None
-		try:
+		# Stub transaction recovery so the test can observe the complete iteration in isolation.
+		with patch.object(Subscription, "process", patched), patch.object(frappe.db, "rollback"):
 			process_all([sub1.name, sub2.name])
-		finally:
-			Subscription.process = original_process
-			frappe.db.rollback = original_rollback
 
 		self.assertEqual(processed, [sub1.name, sub2.name])
 
@@ -778,6 +771,38 @@ class TestSubscription(ERPNextTestSuite):
 		# Subscription status should now be Active (via on_update_after_submit hook)
 		subscription.reload()
 		self.assertEqual(subscription.status, "Active")
+
+	def test_cancelled_subscription_stays_cancelled_after_payment_and_reprocess(self):
+		# https://github.com/frappe/erpnext/issues/57761
+		subscription = create_subscription(
+			start_date=nowdate(),
+			generate_invoice_at="Prepaid (bill at period start)",
+			submit_invoice=1,
+			cancel_at_period_end=1,
+		)
+		subscription.process(posting_date=nowdate())
+		invoice = subscription.get_current_invoice()
+		self.assertGreater(invoice.outstanding_amount, 0)
+
+		subscription.cancel_subscription()
+		self.assertEqual(subscription.status, "Cancelled")
+		cancelation_date = getdate(subscription.cancelation_date)
+		self.assertIsNotNone(cancelation_date)
+
+		payment_entry = get_payment_entry(invoice.doctype, invoice.name, bank_account="_Test Bank - _TC")
+		payment_entry.reference_no = "12345"
+		payment_entry.reference_date = nowdate()
+		payment_entry.submit()
+
+		subscription.reload()
+		self.assertEqual(subscription.status, "Cancelled")
+		self.assertEqual(getdate(subscription.cancelation_date), cancelation_date)
+
+		invoice_count = len(subscription.invoices)
+		subscription.process()
+		subscription.reload()
+		self.assertEqual(subscription.status, "Cancelled")
+		self.assertEqual(len(subscription.invoices), invoice_count)
 
 	def test_first_invoice_generated_on_create_for_prepaid(self):
 		subscription = create_subscription(
@@ -1041,12 +1066,6 @@ def create_plan(**kwargs):
 
 
 def create_parties():
-	if not frappe.db.exists("Supplier", "_Test Supplier"):
-		supplier = frappe.new_doc("Supplier")
-		supplier.supplier_name = "_Test Supplier"
-		supplier.supplier_group = "All Supplier Groups"
-		supplier.insert()
-
 	if not frappe.db.exists("Customer", "_Test Subscription Customer"):
 		customer = frappe.new_doc("Customer")
 		customer.customer_name = "_Test Subscription Customer"

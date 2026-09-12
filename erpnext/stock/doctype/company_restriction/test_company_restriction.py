@@ -3,8 +3,10 @@
 
 import frappe
 
+from erpnext.accounts.party import get_party_details
 from erpnext.buying.doctype.purchase_order.test_purchase_order import create_purchase_order
 from erpnext.buying.doctype.supplier.test_supplier import create_supplier
+from erpnext.controllers.queries import party_query
 from erpnext.selling.doctype.customer.test_customer import make_customer
 from erpnext.selling.doctype.quotation.test_quotation import make_quotation
 from erpnext.stock.doctype.company_restriction.company_restriction import CompanyRestrictionError
@@ -51,6 +53,71 @@ class TestCompanyRestriction(ERPNextTestSuite):
 		self.restrict_to_companies("Supplier", supplier.name, ["_Test Company"])
 		create_purchase_order(supplier=supplier.name, do_not_submit=1)
 
+	def test_party_query_filters_customer_and_supplier_by_transaction_company(self):
+		customer = make_customer("_Test Company Query Restricted Customer")
+		supplier = create_supplier(supplier_name="_Test Company Query Restricted Supplier")
+
+		for doctype, party in (("Customer", customer), ("Supplier", supplier.name)):
+			self.restrict_to_companies(doctype, party, ["_Test Company 1"])
+
+			results = party_query(
+				doctype,
+				party,
+				"name",
+				0,
+				20,
+				filters={"disabled": 0, "company": "_Test Company"},
+			)
+			self.assertNotIn(party, [row[0] for row in results])
+
+			results = party_query(
+				doctype,
+				party,
+				"name",
+				0,
+				20,
+				filters={"disabled": 0, "company": "_Test Company 1"},
+			)
+			self.assertIn(party, [row[0] for row in results])
+
+	def test_get_party_details_checks_transaction_company_restriction(self):
+		customer = make_customer("_Test Party Details Restricted Customer")
+		supplier = create_supplier(supplier_name="_Test Party Details Restricted Supplier")
+
+		for doctype, party in (("Customer", customer), ("Supplier", supplier.name)):
+			self.restrict_to_companies(doctype, party, ["_Test Company 1"])
+
+			self.assertRaises(
+				CompanyRestrictionError,
+				get_party_details,
+				party=party,
+				party_type=doctype,
+				company="_Test Company",
+			)
+
+	def test_unrestricted_party_ignores_company_permission(self):
+		customer = make_customer("_Test Party Details Company Permission Customer")
+		user = self.make_user_with_roles("test_party_details_company@example.com", ["Sales User"])
+		self.allow_company(user, "_Test Company 1")
+
+		with self.set_user(user):
+			results = party_query(
+				"Customer",
+				customer,
+				"name",
+				0,
+				20,
+				filters={"disabled": 0, "company": "_Test Company"},
+			)
+			self.assertIn(customer, [row[0] for row in results])
+
+			details = get_party_details(
+				party=customer,
+				party_type="Customer",
+				company="_Test Company",
+			)
+			self.assertEqual(details.customer, customer)
+
 	def test_unrestricted_item_is_not_blocked(self):
 		item = make_item()
 		make_material_request(item_code=item.name)
@@ -80,6 +147,61 @@ class TestCompanyRestriction(ERPNextTestSuite):
 		stock_entry.reload()
 		stock_entry.cancel()
 
+	def allow_company(self, user, company):
+		permission = {
+			"user": user,
+			"allow": "Company",
+			"for_value": company,
+			"apply_to_all_doctypes": 1,
+		}
+		if not frappe.db.exists("User Permission", permission):
+			frappe.get_doc({"doctype": "User Permission", **permission}).insert(ignore_permissions=True)
+		frappe.clear_cache(user=user)
+
+	def make_item_price(self, item_code):
+		return (
+			frappe.get_doc(
+				{
+					"doctype": "Item Price",
+					"price_list": "_Test Price List",
+					"item_code": item_code,
+					"price_list_rate": 100,
+				}
+			)
+			.insert()
+			.name
+		)
+
+	def test_item_price_inherits_item_company_restriction(self):
+		restricted = make_item()
+		allowed = make_item()
+		self.restrict_to_companies("Item", restricted.name, ["_Test Company 1"])
+		prices = {item.name: self.make_item_price(item.name) for item in (restricted, allowed)}
+
+		user = self.make_user_with_roles("test_item_price_restriction@example.com", ["Sales Master Manager"])
+		self.allow_company(user, "_Test Company")
+
+		with self.set_user(user):
+			visible = frappe.get_list(
+				"Item Price",
+				filters={"item_code": ("in", [restricted.name, allowed.name])},
+				pluck="item_code",
+			)
+			self.assertEqual(visible, [allowed.name])
+
+			self.assertFalse(frappe.has_permission("Item Price", doc=prices[restricted.name]))
+			self.assertTrue(frappe.has_permission("Item Price", doc=prices[allowed.name]))
+
+	def test_item_price_is_visible_without_company_permission(self):
+		restricted = make_item()
+		self.restrict_to_companies("Item", restricted.name, ["_Test Company 1"])
+		price = self.make_item_price(restricted.name)
+
+		user = self.make_user_with_roles("test_item_price_unrestricted@example.com", ["Sales Master Manager"])
+
+		with self.set_user(user):
+			self.assertTrue(frappe.has_permission("Item Price", doc=price))
+
 	def make_user_with_roles(self, email, roles):
 		if not frappe.db.exists("User", email):
 			frappe.get_doc(
@@ -107,14 +229,12 @@ class TestCompanyRestriction(ERPNextTestSuite):
 		permitted = frappe.get_meta("Customer").get_permitted_fieldnames(user=manager)
 		self.assertIn("restrict_to_companies", permitted)
 
-		frappe.set_user(sales_user)
-		self.addCleanup(frappe.set_user, "Administrator")
+		with self.set_user(sales_user):
+			doc = frappe.get_doc("Customer", customer)
+			doc.restrict_to_companies = 0
+			doc.set("allowed_companies", [])
+			doc.save()
 
-		doc = frappe.get_doc("Customer", customer)
-		doc.restrict_to_companies = 0
-		doc.set("allowed_companies", [])
-		doc.save()
-
-		doc.reload()
-		self.assertEqual(doc.restrict_to_companies, 1)
-		self.assertEqual([row.company for row in doc.allowed_companies], ["_Test Company"])
+			doc.reload()
+			self.assertEqual(doc.restrict_to_companies, 1)
+			self.assertEqual([row.company for row in doc.allowed_companies], ["_Test Company"])
